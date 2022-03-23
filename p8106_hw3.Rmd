@@ -1,0 +1,197 @@
+---
+title: "p8106_hw3"
+author: "Hao Zheng (hz2770)"
+date: "2022/3/19"
+output: pdf_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(tidyverse)
+library(caret)
+library(MASS)
+library(pROC)
+library(vip)
+library(corrplot)
+library(AppliedPredictiveModeling)
+```
+
+```{r}
+# data import
+auto_data = 
+  read.csv("./data/auto.csv") %>% 
+  mutate(
+    origin = as.factor(origin),
+    mpg_cat = as.factor(mpg_cat),
+    mpg_cat = fct_relevel(mpg_cat, c("low", "high"))
+  ) %>% 
+  na.omit()
+
+set.seed(2022)
+
+indexTrain <- createDataPartition(y = auto_data$mpg_cat, p = 0.7, list = FALSE)
+trainData <- auto_data[indexTrain,]
+testData <- auto_data[-indexTrain,]
+head(trainData)
+
+ctrl <- trainControl(method = "repeatedcv", repeats = 5,
+                     summaryFunction = twoClassSummary,
+                     classProbs = TRUE)
+```
+
+## a) Exploratory data analysis
+```{r}
+# numeric summary
+summary(trainData)
+
+# correlation Plot
+x <- trainData[,1:7]
+y <- trainData$mpg_cat
+corrplot(cor(x %>% dplyr::select(-origin)), method = "circle", type = "full")
+
+# Feature Plot
+theme1 <- transparentTheme(trans = .4)
+trellis.par.set(theme1)
+
+featurePlot(x %>% dplyr::select(-origin),
+            y,
+            scales = list(x = list(relation = "free"),
+                          y = list(relation = "free")),
+            plot = "density", pch ="|",
+            auto.key = list(columns = 2))
+```
+
+Here, we focus on the training dataset to do explanatory analysis. We have 7 predictors, including 6 numeric variables and 1 factor variable `origin`. The response variable is `mpg_cat`.
+
+From the correlation plot, we can observe that the variables `cylinders`, `displacement`, `horsepower`, `weight` may be positively related with each other, and negatively related to `acceleration`, `year`.
+
+From the feature plot, we see that high MPG may be associated with low weight, large model year, small number of cylinders, small engine displacement and small horsepower.
+
+## b) Logistic Regression
+```{r}
+glm.fit <- glm(mpg_cat ~ .,
+               data = auto_data,
+               subset = indexTrain,
+               family = binomial(link = "logit"))
+
+summary(glm.fit)
+```
+
+Fit a glm model using the training data. Among all the predictors, the variables `weight`, `year` and `origin` as European are quite significant.
+
+```{r}
+test.pred.prob <- predict(glm.fit, newdata = auto_data[-indexTrain,],
+                          type = "response")
+test.pred <- rep("low", length(test.pred.prob))
+test.pred[test.pred.prob > 0.5] <- "high"
+confusionMatrix(data = as.factor(test.pred),
+                reference = auto_data$mpg_cat[-indexTrain],
+                positive = "high")
+```
+
+From the confusion matrix above, we calculate that correct prediction rate: (50 + 49)/(50 + 9 + 8 + 49)  = 0.8534.
+
+The confusion matrix also tells us: The no information rate is 0.5, that is the misclassification rate if predict everyone to be positive is 0.5, which is not very ideal. The p-value is 1.478e-15. The sensitivity is 0.8448, specificity is 0.8621. The positive predictive value is 0.8596, negative predictive value is 0.8475.
+```{r}
+# logistic model using caret
+set.seed(2022)
+
+model.glm = train(x = auto_data[indexTrain, 1:7],
+                  y = auto_data$mpg_cat[indexTrain],
+                  method = "glm",
+                  metric = "ROC",
+                  trControl = ctrl)
+summary(model.glm)
+```
+
+
+## c) Multivariate adaptive regression spline(MARS)
+```{r, warning=FALSE}
+mars_grid <- expand.grid(degree = 1:3,
+                         nprune = 2:25)
+set.seed(2022)
+mars.fit <- train(x,
+                  y,
+                  method = "earth",
+                  tuneGrid = mars_grid,
+                  trControl = ctrl)
+summary(mars.fit)
+
+ggplot(mars.fit)
+
+mars.fit$bestTune
+coef(mars.fit$finalModel)
+```
+
+Our MARS model select 6 of 19 terms, with 4 out of 8 predictors (nprune = 6). The final model has RSS = 15.06263, R-squared = 0.781701, which is quite big.
+
+## d) LDA
+```{r}
+set.seed(2022)
+
+lda.fit <- lda(mpg_cat~., data = auto_data,
+               subset = indexTrain)
+
+par(mar = rep(2,4))
+plot(lda.fit)
+
+# The matrix A
+lda.fit$scaling
+```
+
+We perform a LDA fit model. The linear discriminate is plotted above within two classes. Since k=2, we only have k - 1 = 1 linear discriminant. 
+
+```{r}
+# Use caret to conduct LDA
+set.seed(2022)
+
+x = x %>% 
+  mutate(
+    origin = as.numeric(origin)
+  )
+
+model.lda <- train(x,
+                   y = auto_data$mpg_cat[indexTrain],
+                   method = "lda",
+                   metric = "ROC",
+                   trControl = ctrl)
+
+model.lda$results
+summary(model.lda$finalModel)
+plot(model.lda$finalModel)
+```
+
+
+## e) Model selection
+```{r}
+res <- resamples(list(GLM = model.glm,
+                      MARS = mars.fit,
+                      LDA = model.lda))
+summary(res)
+
+bwplot(res, metric = "ROC")
+```
+
+Compare the three fit using training data, the MARS model has a rather high ROC.
+
+Now let's plot the ROC curve for MARS model using test data.
+```{r}
+mars.pred <- predict(mars.fit, newdata = auto_data[-indexTrain, 1:7], type = "prob")[,2]
+roc.mars <- roc(auto_data$mpg_cat[-indexTrain], mars.pred)
+# AUC
+auc_mars <- roc.mars$auc[1];auc_mars
+
+plot(roc.mars, legacy.axis = TRUE)
+```
+
+The ROC curve of MARS model for the test data is as above. The AUC value is `r auc_mars`. 
+
+```{r}
+test.pred <- rep("low", length(mars.pred))
+test.pred[mars.pred > 0.5] <- "high"
+confusionMatrix(data = as.factor(test.pred),
+                reference = auto_data$mpg_cat[-indexTrain],
+                positive = "high")
+```
+
+The classifications rate of the MARS model on the test data can be calculated by conduct the confusion matrix. The misclassification error rate is 1 - 0.8793 = 0.1207.
